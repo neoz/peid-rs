@@ -14,6 +14,7 @@ use peid_rs::db::{parse_db_lossy, SigSource};
 use peid_rs::scanner::{scan, Mode};
 use peid_rs::section_db::{detect_pe as detect_pe_sections, SectionHit};
 use peid_rs::signature::{Signature, SignatureDb};
+use peid_rs::toolchain::{detect as detect_toolchain, ToolchainInfo};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -198,6 +199,7 @@ struct ScanResult {
     arch: Option<String>,
     is_dotnet: bool,
     finding: Finding,
+    toolchain: ToolchainInfo,
 }
 
 enum Finding {
@@ -254,7 +256,15 @@ fn scan_file(path: &Path, db: &SignatureDb, mode: Mode, raw: bool) -> Result<Sca
             bytes: &mmap,
         };
         let hit = scan(db, &view, Mode::Hardcore);
-        return Ok(build_result(None, None, false, hit, None, None));
+        return Ok(build_result(
+            None,
+            None,
+            false,
+            hit,
+            None,
+            None,
+            ToolchainInfo::default(),
+        ));
     }
 
     match BinaryView::parse(&mmap) {
@@ -268,7 +278,16 @@ fn scan_file(path: &Path, db: &SignatureDb, mode: Mode, raw: bool) -> Result<Sca
             } else {
                 None
             };
-            Ok(build_result(format, arch, is_dotnet, hit, section_hit, view.dotnet.as_ref()))
+            let toolchain = detect_toolchain(&view);
+            Ok(build_result(
+                format,
+                arch,
+                is_dotnet,
+                hit,
+                section_hit,
+                view.dotnet.as_ref(),
+                toolchain,
+            ))
         }
         Err(BinaryParseError::Unrecognized) => Ok(ScanResult {
             format: None,
@@ -277,12 +296,14 @@ fn scan_file(path: &Path, db: &SignatureDb, mode: Mode, raw: bool) -> Result<Sca
             finding: Finding::Unrecognized {
                 reason: "unrecognized format".to_string(),
             },
+            toolchain: ToolchainInfo::default(),
         }),
         Err(BinaryParseError::Goblin(s)) => Ok(ScanResult {
             format: None,
             arch: None,
             is_dotnet: false,
             finding: Finding::Unrecognized { reason: s },
+            toolchain: ToolchainInfo::default(),
         }),
     }
 }
@@ -294,6 +315,7 @@ fn build_result(
     hit: Option<&Signature>,
     section_hit: Option<SectionHit>,
     dotnet: Option<&DotNetInfo>,
+    toolchain: ToolchainInfo,
 ) -> ScanResult {
     let finding = if let Some(sig) = hit {
         Finding::Signature {
@@ -317,12 +339,13 @@ fn build_result(
         arch,
         is_dotnet,
         finding,
+        toolchain,
     }
 }
 
 fn render_text(result: &ScanResult, db: &SignatureDb) -> String {
     let tag = format_tag(result.format, result.arch.as_deref(), result.is_dotnet);
-    match &result.finding {
+    let body = match &result.finding {
         Finding::Signature { name, source } => {
             let prefix = if matches!(source, SigSource::External) { "* " } else { "" };
             format!("{}{}{}", tag, prefix, name)
@@ -342,6 +365,21 @@ fn render_text(result: &ScanResult, db: &SignatureDb) -> String {
                 format!("Not a valid binary ({})", reason)
             }
         }
+    };
+    let mut bits: Vec<String> = Vec::new();
+    if let Some(l) = &result.toolchain.linker {
+        bits.push(format!("linker {}", l));
+    }
+    if let Some(c) = &result.toolchain.compiler {
+        bits.push(format!("compiler {}", c));
+    }
+    if let Some(p) = &result.toolchain.platform {
+        bits.push(format!("platform {}", p));
+    }
+    if bits.is_empty() {
+        body
+    } else {
+        format!("{}  [{}]", body, bits.join("; "))
     }
 }
 
@@ -406,6 +444,37 @@ fn render_json(path: &Path, result: &ScanResult) -> String {
         "section".to_string(),
         section.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null),
     );
+
+    let mut tc = serde_json::Map::new();
+    tc.insert(
+        "linker".to_string(),
+        result
+            .toolchain
+            .linker
+            .clone()
+            .map(serde_json::Value::String)
+            .unwrap_or(serde_json::Value::Null),
+    );
+    tc.insert(
+        "compiler".to_string(),
+        result
+            .toolchain
+            .compiler
+            .clone()
+            .map(serde_json::Value::String)
+            .unwrap_or(serde_json::Value::Null),
+    );
+    tc.insert(
+        "platform".to_string(),
+        result
+            .toolchain
+            .platform
+            .clone()
+            .map(serde_json::Value::String)
+            .unwrap_or(serde_json::Value::Null),
+    );
+    obj.insert("toolchain".to_string(), serde_json::Value::Object(tc));
+
     serde_json::Value::Object(obj).to_string()
 }
 

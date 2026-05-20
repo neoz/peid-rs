@@ -64,11 +64,11 @@ peid-rs -hard -time --no-ext C:\suspicious.bin
 Examples:
 
 ```
-foo.exe       : (PE x86)            UPX -> www.upx.sourceforge.net
-managed.dll   : (PE .NET x86)       Microsoft Visual C# / Basic .NET
-linux.so      : (ELF aarch64)       Nothing found *
-mac.dylib     : (Mach-O x86_64)     Nothing found *
-vmp.exe       : (PE x86_64)         VMProtect 3.x (heuristic) [section: .qWo, .xz@]
+foo.exe       : (PE x86)            UPX -> www.upx.sourceforge.net  [linker 9.0 (VS 2008); compiler MSVC (Rich: 10 entries, latest build 20413)]
+managed.dll   : (PE .NET x86)       Microsoft Visual C# / Basic .NET  [linker 14.0 (VS 2015)]
+linux.so      : (ELF aarch64)       Nothing found *  [compiler GCC: (Ubuntu 9.4.0-1ubuntu1~20.04.1) 9.4.0]
+mac.dylib     : (Mach-O x86_64)     Nothing found *  [platform macOS minos=10.9 sdk=10.9]
+vmp.exe       : (PE x86_64)         VMProtect 3.x (heuristic) [section: .qWo, .xz@]  [linker 14.0 (VS 2015)]
 ```
 
 Conventions inherited from PEiD:
@@ -80,7 +80,7 @@ Conventions inherited from PEiD:
 
 ## How detection works
 
-Three detectors run in order; the first to fire wins:
+Three packer detectors run in order; the first to fire wins:
 
 1. **Byte signatures** (PEiD format, wildcards via `??`). Scanned at either
    the entry point (Normal), the EP section (Deep), or the whole file
@@ -94,6 +94,18 @@ Three detectors run in order; the first to fire wins:
 3. **.NET fallback**. If no signature or section rule fired but the PE has
    a CLR data directory, the result reports the .NET runtime version and IL
    / mixed-mode flag.
+
+A separate **toolchain detector** runs independently and is reported
+alongside the packer result. It surfaces:
+
+- **PE**: linker version from the optional header (`6.0` → VC6, `14.0` →
+  VS 2015, `14.3x` → VS 2022, `2.x` → GNU ld / MinGW) plus a Rich-header
+  walk that decodes the (ProdID, Build) tuples MSVC's linker embeds. The
+  highest ProdID found is mapped to a Visual Studio release.
+- **ELF**: the `.comment` section's strings (e.g. `GCC: (Ubuntu 9.4.0-...)
+  9.4.0`, `Ubuntu clang version 14.0.0`, Rust toolchain identifier).
+- **Mach-O**: `LC_BUILD_VERSION` / `LC_VERSION_MIN_*` decoded into
+  `platform minos=X.Y sdk=X.Y`.
 
 ## Supported binaries
 
@@ -146,11 +158,11 @@ if let Some(sig) = scan(&db, &view, Mode::Normal) {
 ## Status
 
 v1: PE / ELF / Mach-O parsing, byte-signature engine, section-name detector
-with VMProtect 3.x heuristic, .NET detection, three scan modes plus
-`--raw`, parallel directory scanning, text and JSONL output.
+with VMProtect 3.x heuristic, .NET detection, toolchain detector (PE linker
++ Rich header, ELF `.comment`, Mach-O `LC_BUILD_VERSION`), three scan modes
+plus `--raw`, parallel directory scanning, text and JSONL output.
 
-Not yet: .NET-specific signature database, Rich-header MSVC version
-detection, plugin support.
+Not yet: .NET-specific signature database, plugin support.
 
 ## License
 
