@@ -7,6 +7,10 @@ license.workspace = true
 [dependencies]
 goblin = { workspace = true }
 md-5 = { workspace = true }
+cms = { workspace = true }
+x509-cert = { workspace = true }
+der = { workspace = true }
+const-oid = { workspace = true, features = ["db"] }
 
 [lib]
 path = "src/lib.rs"

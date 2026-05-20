@@ -1,3 +1,4 @@
+pub mod authenticode;
 pub mod binary;
 pub mod db;
 pub mod entropy;
@@ -8,6 +9,7 @@ pub mod section_db;
 pub mod signature;
 pub mod toolchain;
 
+pub use authenticode::{detect as detect_authenticode, SignatureInfo};
 pub use binary::{Arch, BinaryFormat, BinaryView, DotNetInfo};
 pub use db::SigSource;
 pub use entropy::{analyze as analyze_entropy, SectionEntropy, HIGH_ENTROPY_THRESHOLD};

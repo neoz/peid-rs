@@ -138,6 +138,13 @@ Two additional analyses run on every parsed binary:
 - **PE import hash (imphash)**. Standard Mandiant algorithm: MD5 of the
   normalized `dll.function` import list. Used for cross-tool fingerprinting
   and clustering of related samples.
+- **Authenticode signer** (PE only). When the PE has an embedded code
+  signature, parse the PKCS#7 / CMS SignedData blob and extract the
+  signer's Subject CN, Organization, Issuer CN, validity dates, and serial
+  number. Surfaces e.g. `signed-by "Microsoft Windows"`, `signed-by "Docker
+  Inc"`. Catalog-signed Microsoft system binaries with no embedded
+  signature correctly show as unsigned (the signature lives in `.cat`
+  files, not in the PE).
 
 ## Supported binaries
 
@@ -192,10 +199,11 @@ if let Some(sig) = scan(&db, &view, Mode::Normal) {
 v1: PE / ELF / Mach-O parsing, byte-signature engine, section-name detector
 with VMProtect 3.x heuristic, .NET detection, toolchain detector (PE linker
 + Rich header, ELF `.comment`, Mach-O `LC_BUILD_VERSION`, Go / Swift),
-Shannon entropy analysis, PE import hash (imphash), three scan modes plus
-`--raw`, parallel directory scanning, text and JSONL output, fallback
-fileinfo (text encoding / line ending / kind, magic-byte detection for
-common archives / images / documents / fonts).
+Shannon entropy analysis, PE import hash (imphash), Authenticode signer
+extraction, three scan modes plus `--raw`, parallel directory scanning,
+text and JSONL output, fallback fileinfo (text encoding / line ending /
+kind, magic-byte detection for common archives / images / documents /
+fonts).
 
 Not yet: .NET-specific signature database, plugin support.
 

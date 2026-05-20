@@ -19,6 +19,10 @@ rayon = "1.10"
 clap = { version = "4.5", features = ["derive"] }
 anyhow = "1.0"
 md-5 = "0.10"
+cms = "0.2"
+x509-cert = "0.2"
+der = "0.7"
+const-oid = "0.9"
 
 [profile.release]
 lto = "thin"

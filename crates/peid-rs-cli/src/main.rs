@@ -9,6 +9,7 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 use walkdir::WalkDir;
 
+use peid_rs::authenticode::{detect as detect_authenticode, SignatureInfo};
 use peid_rs::binary::{BinaryFormat, BinaryView, DotNetInfo};
 use peid_rs::db::{parse_db_lossy, SigSource};
 use peid_rs::entropy::{
@@ -210,6 +211,7 @@ struct ScanResult {
     toolchain: ToolchainInfo,
     entropy: Vec<SectionEntropy>,
     imphash: Option<ImpHash>,
+    signature: Option<SignatureInfo>,
 }
 
 enum Finding {
@@ -285,6 +287,7 @@ fn scan_file(path: &Path, db: &SignatureDb, mode: Mode, raw: bool) -> Result<Sca
             ToolchainInfo::default(),
             Vec::new(),
             None,
+            None,
         ));
     }
 
@@ -302,6 +305,7 @@ fn scan_file(path: &Path, db: &SignatureDb, mode: Mode, raw: bool) -> Result<Sca
             let toolchain = detect_toolchain(&view);
             let entropy = analyze_entropy(&view);
             let imphash = compute_imphash(&view);
+            let signature = detect_authenticode(&view);
             Ok(build_result(
                 format,
                 arch,
@@ -312,6 +316,7 @@ fn scan_file(path: &Path, db: &SignatureDb, mode: Mode, raw: bool) -> Result<Sca
                 toolchain,
                 entropy,
                 imphash,
+                signature,
             ))
         }
         Err(_) => {
@@ -332,6 +337,7 @@ fn scan_file(path: &Path, db: &SignatureDb, mode: Mode, raw: bool) -> Result<Sca
                 toolchain: ToolchainInfo::default(),
                 entropy: Vec::new(),
                 imphash: None,
+                signature: None,
             })
         }
     }
@@ -347,6 +353,7 @@ fn build_result(
     toolchain: ToolchainInfo,
     entropy: Vec<SectionEntropy>,
     imphash: Option<ImpHash>,
+    signature: Option<SignatureInfo>,
 ) -> ScanResult {
     let finding = if let Some(sig) = hit {
         Finding::Signature {
@@ -373,6 +380,7 @@ fn build_result(
         toolchain,
         entropy,
         imphash,
+        signature,
     }
 }
 
@@ -425,6 +433,18 @@ fn render_text(result: &ScanResult, db: &SignatureDb) -> String {
     }
     if let Some(ih) = &result.imphash {
         bits.push(format!("imphash {} ({} imports)", ih.hex, ih.entries));
+    }
+    if let Some(sig) = &result.signature {
+        let signer = sig
+            .signer_cn
+            .clone()
+            .or_else(|| sig.signer_o.clone())
+            .unwrap_or_else(|| "<unparsed>".to_string());
+        if sig.parse_error.is_some() {
+            bits.push(format!("signed (unparsed; {} bytes)", sig.raw_size));
+        } else {
+            bits.push(format!("signed-by \"{}\"", signer));
+        }
     }
     if has_suspicious_entropy(&result.entropy) {
         let suspects: Vec<String> = result
@@ -579,6 +599,74 @@ fn render_json(path: &Path, result: &ScanResult) -> String {
                 o.insert(
                     "entries".to_string(),
                     serde_json::Value::Number(serde_json::Number::from(ih.entries)),
+                );
+                serde_json::Value::Object(o)
+            }
+            None => serde_json::Value::Null,
+        },
+    );
+
+    obj.insert(
+        "signature".to_string(),
+        match &result.signature {
+            Some(sig) => {
+                let mut o = serde_json::Map::new();
+                let signed = sig.parse_error.is_none()
+                    || sig.signer_cn.is_some()
+                    || sig.signer_o.is_some();
+                o.insert("signed".to_string(), serde_json::Value::Bool(signed));
+                o.insert(
+                    "raw_size".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(sig.raw_size)),
+                );
+                o.insert(
+                    "signer_cn".to_string(),
+                    sig.signer_cn
+                        .clone()
+                        .map(serde_json::Value::String)
+                        .unwrap_or(serde_json::Value::Null),
+                );
+                o.insert(
+                    "signer_o".to_string(),
+                    sig.signer_o
+                        .clone()
+                        .map(serde_json::Value::String)
+                        .unwrap_or(serde_json::Value::Null),
+                );
+                o.insert(
+                    "issuer_cn".to_string(),
+                    sig.issuer_cn
+                        .clone()
+                        .map(serde_json::Value::String)
+                        .unwrap_or(serde_json::Value::Null),
+                );
+                o.insert(
+                    "not_before".to_string(),
+                    sig.not_before
+                        .clone()
+                        .map(serde_json::Value::String)
+                        .unwrap_or(serde_json::Value::Null),
+                );
+                o.insert(
+                    "not_after".to_string(),
+                    sig.not_after
+                        .clone()
+                        .map(serde_json::Value::String)
+                        .unwrap_or(serde_json::Value::Null),
+                );
+                o.insert(
+                    "serial_hex".to_string(),
+                    sig.serial_hex
+                        .clone()
+                        .map(serde_json::Value::String)
+                        .unwrap_or(serde_json::Value::Null),
+                );
+                o.insert(
+                    "parse_error".to_string(),
+                    sig.parse_error
+                        .clone()
+                        .map(serde_json::Value::String)
+                        .unwrap_or(serde_json::Value::Null),
                 );
                 serde_json::Value::Object(o)
             }
