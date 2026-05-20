@@ -118,13 +118,26 @@ A separate **toolchain detector** runs independently and is reported
 alongside the packer result. It surfaces:
 
 - **PE**: linker version from the optional header (`6.0` → VC6, `14.0` →
-  VS 2015, `14.3x` → VS 2022, `2.x` → GNU ld / MinGW) plus a Rich-header
-  walk that decodes the (ProdID, Build) tuples MSVC's linker embeds. The
-  highest ProdID found is mapped to a Visual Studio release.
+  VS 2015, `14.3x` → VS 2022, `2.x` → GNU ld / MinGW, `3.0` → Go), Rich-header
+  walk that decodes the (ProdID, Build) tuples MSVC's linker embeds, and
+  Go detection (`.gopclntab` / `go.buildid` sections or linker version 3.0).
 - **ELF**: the `.comment` section's strings (e.g. `GCC: (Ubuntu 9.4.0-...)
-  9.4.0`, `Ubuntu clang version 14.0.0`, Rust toolchain identifier).
+  9.4.0`, `Ubuntu clang version 14.0.0`); Go via `.gopclntab` /
+  `.note.go.buildid` section names.
 - **Mach-O**: `LC_BUILD_VERSION` / `LC_VERSION_MIN_*` decoded into
-  `platform minos=X.Y sdk=X.Y`.
+  `platform minos=X.Y sdk=X.Y`; Swift via `__swift5_*` Mach-O section names
+  or `libswiftCore.dylib` load command; Go via `__gopclntab` /
+  `__go_buildinfo` sections.
+
+Two additional analyses run on every parsed binary:
+
+- **Section entropy** (PE / ELF / Mach-O segment). Shannon entropy per
+  section; sections with entropy ≥ 7.5 are surfaced in the output as a
+  packer / encryption fingerprint. This works independently of the byte
+  and section-name detectors — useful for unknown packers.
+- **PE import hash (imphash)**. Standard Mandiant algorithm: MD5 of the
+  normalized `dll.function` import list. Used for cross-tool fingerprinting
+  and clustering of related samples.
 
 ## Supported binaries
 
@@ -178,8 +191,11 @@ if let Some(sig) = scan(&db, &view, Mode::Normal) {
 
 v1: PE / ELF / Mach-O parsing, byte-signature engine, section-name detector
 with VMProtect 3.x heuristic, .NET detection, toolchain detector (PE linker
-+ Rich header, ELF `.comment`, Mach-O `LC_BUILD_VERSION`), three scan modes
-plus `--raw`, parallel directory scanning, text and JSONL output.
++ Rich header, ELF `.comment`, Mach-O `LC_BUILD_VERSION`, Go / Swift),
+Shannon entropy analysis, PE import hash (imphash), three scan modes plus
+`--raw`, parallel directory scanning, text and JSONL output, fallback
+fileinfo (text encoding / line ending / kind, magic-byte detection for
+common archives / images / documents / fonts).
 
 Not yet: .NET-specific signature database, plugin support.
 

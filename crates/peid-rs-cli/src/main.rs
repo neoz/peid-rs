@@ -11,7 +11,12 @@ use walkdir::WalkDir;
 
 use peid_rs::binary::{BinaryFormat, BinaryView, DotNetInfo};
 use peid_rs::db::{parse_db_lossy, SigSource};
+use peid_rs::entropy::{
+    analyze as analyze_entropy, has_suspicious as has_suspicious_entropy, SectionEntropy,
+    HIGH_ENTROPY_THRESHOLD,
+};
 use peid_rs::fileinfo::{detect as detect_fileinfo, FileInfo, MagicHit, TextInfo};
+use peid_rs::imphash::{compute as compute_imphash, ImpHash};
 use peid_rs::scanner::{scan, Mode};
 use peid_rs::section_db::{detect_pe as detect_pe_sections, SectionHit};
 use peid_rs::signature::{Signature, SignatureDb};
@@ -203,6 +208,8 @@ struct ScanResult {
     is_dotnet: bool,
     finding: Finding,
     toolchain: ToolchainInfo,
+    entropy: Vec<SectionEntropy>,
+    imphash: Option<ImpHash>,
 }
 
 enum Finding {
@@ -276,6 +283,8 @@ fn scan_file(path: &Path, db: &SignatureDb, mode: Mode, raw: bool) -> Result<Sca
             None,
             None,
             ToolchainInfo::default(),
+            Vec::new(),
+            None,
         ));
     }
 
@@ -291,6 +300,8 @@ fn scan_file(path: &Path, db: &SignatureDb, mode: Mode, raw: bool) -> Result<Sca
                 None
             };
             let toolchain = detect_toolchain(&view);
+            let entropy = analyze_entropy(&view);
+            let imphash = compute_imphash(&view);
             Ok(build_result(
                 format,
                 arch,
@@ -299,6 +310,8 @@ fn scan_file(path: &Path, db: &SignatureDb, mode: Mode, raw: bool) -> Result<Sca
                 section_hit,
                 view.dotnet.as_ref(),
                 toolchain,
+                entropy,
+                imphash,
             ))
         }
         Err(_) => {
@@ -317,6 +330,8 @@ fn scan_file(path: &Path, db: &SignatureDb, mode: Mode, raw: bool) -> Result<Sca
                 is_dotnet: false,
                 finding,
                 toolchain: ToolchainInfo::default(),
+                entropy: Vec::new(),
+                imphash: None,
             })
         }
     }
@@ -330,6 +345,8 @@ fn build_result(
     section_hit: Option<SectionHit>,
     dotnet: Option<&DotNetInfo>,
     toolchain: ToolchainInfo,
+    entropy: Vec<SectionEntropy>,
+    imphash: Option<ImpHash>,
 ) -> ScanResult {
     let finding = if let Some(sig) = hit {
         Finding::Signature {
@@ -354,6 +371,8 @@ fn build_result(
         is_dotnet,
         finding,
         toolchain,
+        entropy,
+        imphash,
     }
 }
 
@@ -398,8 +417,23 @@ fn render_text(result: &ScanResult, db: &SignatureDb) -> String {
     if let Some(c) = &result.toolchain.compiler {
         bits.push(format!("compiler {}", c));
     }
+    if let Some(lang) = &result.toolchain.language {
+        bits.push(format!("language {}", lang));
+    }
     if let Some(p) = &result.toolchain.platform {
         bits.push(format!("platform {}", p));
+    }
+    if let Some(ih) = &result.imphash {
+        bits.push(format!("imphash {} ({} imports)", ih.hex, ih.entries));
+    }
+    if has_suspicious_entropy(&result.entropy) {
+        let suspects: Vec<String> = result
+            .entropy
+            .iter()
+            .filter(|e| e.entropy >= HIGH_ENTROPY_THRESHOLD)
+            .map(|e| format!("{}={:.2}", e.name, e.entropy))
+            .collect();
+        bits.push(format!("entropy {}", suspects.join(", ")));
     }
     if bits.is_empty() {
         body
@@ -514,6 +548,15 @@ fn render_json(path: &Path, result: &ScanResult) -> String {
             .unwrap_or(serde_json::Value::Null),
     );
     tc.insert(
+        "language".to_string(),
+        result
+            .toolchain
+            .language
+            .clone()
+            .map(serde_json::Value::String)
+            .unwrap_or(serde_json::Value::Null),
+    );
+    tc.insert(
         "platform".to_string(),
         result
             .toolchain
@@ -523,6 +566,53 @@ fn render_json(path: &Path, result: &ScanResult) -> String {
             .unwrap_or(serde_json::Value::Null),
     );
     obj.insert("toolchain".to_string(), serde_json::Value::Object(tc));
+
+    obj.insert(
+        "imphash".to_string(),
+        match &result.imphash {
+            Some(ih) => {
+                let mut o = serde_json::Map::new();
+                o.insert(
+                    "hex".to_string(),
+                    serde_json::Value::String(ih.hex.clone()),
+                );
+                o.insert(
+                    "entries".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(ih.entries)),
+                );
+                serde_json::Value::Object(o)
+            }
+            None => serde_json::Value::Null,
+        },
+    );
+
+    obj.insert(
+        "entropy".to_string(),
+        serde_json::Value::Array(
+            result
+                .entropy
+                .iter()
+                .map(|e| {
+                    let mut o = serde_json::Map::new();
+                    o.insert(
+                        "name".to_string(),
+                        serde_json::Value::String(e.name.clone()),
+                    );
+                    o.insert(
+                        "size".to_string(),
+                        serde_json::Value::Number(serde_json::Number::from(e.size)),
+                    );
+                    o.insert(
+                        "entropy".to_string(),
+                        serde_json::Number::from_f64(e.entropy)
+                            .map(serde_json::Value::Number)
+                            .unwrap_or(serde_json::Value::Null),
+                    );
+                    serde_json::Value::Object(o)
+                })
+                .collect(),
+        ),
+    );
 
     serde_json::Value::Object(obj).to_string()
 }

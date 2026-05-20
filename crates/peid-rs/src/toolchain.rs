@@ -5,6 +5,7 @@ pub struct ToolchainInfo {
     pub linker: Option<String>,
     pub compiler: Option<String>,
     pub platform: Option<String>,
+    pub language: Option<String>,
     pub source: ToolchainSource,
     pub rich_entries: Vec<RichEntry>,
 }
@@ -30,7 +31,10 @@ pub struct RichEntry {
 
 impl ToolchainInfo {
     pub fn is_empty(&self) -> bool {
-        self.linker.is_none() && self.compiler.is_none() && self.platform.is_none()
+        self.linker.is_none()
+            && self.compiler.is_none()
+            && self.platform.is_none()
+            && self.language.is_none()
     }
 }
 
@@ -49,6 +53,17 @@ fn detect_pe(view: &BinaryView<'_>) -> ToolchainInfo {
     };
     let mut info = ToolchainInfo::default();
 
+    let mut has_zdebug = false;
+    for sec in &pe.sections {
+        let name = sec.name().unwrap_or("").trim_end_matches('\0');
+        if name == ".gopclntab" || name == "go.buildid" {
+            info.language = Some("Go".to_string());
+        }
+        if name.starts_with(".zdebug_") {
+            has_zdebug = true;
+        }
+    }
+
     if let Some(opt) = pe.header.optional_header.as_ref() {
         let maj = opt.standard_fields.major_linker_version;
         let min = opt.standard_fields.minor_linker_version;
@@ -63,7 +78,11 @@ fn detect_pe(view: &BinaryView<'_>) -> ToolchainInfo {
             ));
             info.source = ToolchainSource::PeOptionalHeader;
         }
+        if info.language.is_none() && maj == 3 && min == 0 {
+            info.language = Some("Go".to_string());
+        }
     }
+    let _ = has_zdebug;
 
     if let Some(entries) = parse_rich_header(view.bytes) {
         let latest = entries.iter().max_by_key(|e| e.prod_id);
@@ -201,6 +220,15 @@ fn detect_elf(view: &BinaryView<'_>) -> ToolchainInfo {
         Err(_) => return ToolchainInfo::default(),
     };
     let mut info = ToolchainInfo::default();
+
+    for sh in &elf.section_headers {
+        let name = elf.shdr_strtab.get_at(sh.sh_name).unwrap_or("");
+        if name == ".gopclntab" || name == ".note.go.buildid" {
+            info.language = Some("Go".to_string());
+            break;
+        }
+    }
+
     for sh in &elf.section_headers {
         let name = elf.shdr_strtab.get_at(sh.sh_name).unwrap_or("");
         if name == ".comment" {
@@ -251,6 +279,32 @@ fn detect_macho(view: &BinaryView<'_>) -> ToolchainInfo {
         Mach::Fat(_) => return ToolchainInfo::default(),
     };
     let mut info = ToolchainInfo::default();
+
+    for lc in bin.load_commands.iter() {
+        match lc.command {
+            CommandVariant::LoadDylib(dy) | CommandVariant::LoadWeakDylib(dy) | CommandVariant::LazyLoadDylib(dy) => {
+                let off = lc.offset + dy.dylib.name as usize;
+                if let Some(name) = read_cstr(view.bytes, off) {
+                    if name.contains("libswiftCore") {
+                        info.language = Some("Swift".to_string());
+                    }
+                    if name.contains("libobjc") && info.language.is_none() {
+                        info.language = Some("Objective-C".to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(secs) = macho_section_names(&bin) {
+        if secs.iter().any(|n| n.starts_with("__swift5_") || n == "__swift_protos") {
+            info.language = Some("Swift".to_string());
+        }
+        if secs.iter().any(|n| n == "__gopclntab" || n == "__go_buildinfo") {
+            info.language = Some("Go".to_string());
+        }
+    }
+
     for lc in bin.load_commands.iter() {
         match lc.command {
             CommandVariant::BuildVersion(bv) => {
@@ -299,6 +353,33 @@ fn detect_macho(view: &BinaryView<'_>) -> ToolchainInfo {
         }
     }
     info
+}
+
+fn read_cstr(bytes: &[u8], offset: usize) -> Option<&str> {
+    if offset >= bytes.len() {
+        return None;
+    }
+    let tail = &bytes[offset..];
+    let end = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
+    std::str::from_utf8(&tail[..end]).ok()
+}
+
+fn macho_section_names(bin: &goblin::mach::MachO<'_>) -> Option<Vec<String>> {
+    let mut names = Vec::new();
+    for seg in bin.segments.sections() {
+        for entry in seg {
+            if let Ok((sec, _data)) = entry {
+                let name = std::str::from_utf8(&sec.sectname)
+                    .unwrap_or("")
+                    .trim_end_matches('\0')
+                    .to_string();
+                if !name.is_empty() {
+                    names.push(name);
+                }
+            }
+        }
+    }
+    Some(names)
 }
 
 fn decode_macho_version(v: u32) -> String {

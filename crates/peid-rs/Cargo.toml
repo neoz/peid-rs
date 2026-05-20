@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 goblin = { workspace = true }
+md-5 = { workspace = true }
 
 [lib]
 path = "src/lib.rs"
