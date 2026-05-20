@@ -12,6 +12,7 @@ use walkdir::WalkDir;
 use peid_rs::binary::{BinaryFormat, BinaryParseError, BinaryView, DotNetInfo};
 use peid_rs::db::{parse_db_lossy, SigSource};
 use peid_rs::scanner::{scan, Mode};
+use peid_rs::section_db::{detect_pe as detect_pe_sections, SectionHit};
 use peid_rs::signature::{Signature, SignatureDb};
 
 #[derive(Parser, Debug)]
@@ -48,6 +49,9 @@ struct Args {
     ext: Option<PathBuf>,
     #[arg(long = "no-ext", help = "Skip external.txt")]
     no_ext: bool,
+
+    #[arg(long = "json", help = "Emit one JSON object per file (JSONL)")]
+    json: bool,
 }
 
 fn main() -> Result<()> {
@@ -86,18 +90,17 @@ fn main() -> Result<()> {
         .map(|path| {
             scanned.fetch_add(1, Ordering::Relaxed);
             let line = match scan_file(path, &db, mode, args.raw) {
-                Ok(report) => {
-                    match report.outcome {
-                        Outcome::Hit => {
+                Ok(result) => {
+                    match result.outcome() {
+                        Outcome::SignatureHit | Outcome::SectionHit => {
                             identified.fetch_add(1, Ordering::Relaxed);
                         }
-                        Outcome::Nothing => {}
                         Outcome::Unrecognized => {
                             unrecognized.fetch_add(1, Ordering::Relaxed);
                         }
-                        Outcome::DotNetFallback => {}
+                        Outcome::DotNetFallback | Outcome::Nothing => {}
                     }
-                    match report.format {
+                    match result.format {
                         Some(BinaryFormat::Pe) => {
                             pe_files.fetch_add(1, Ordering::Relaxed);
                         }
@@ -109,19 +112,37 @@ fn main() -> Result<()> {
                         }
                         None => {}
                     }
-                    if report.is_dotnet {
+                    if result.is_dotnet {
                         dotnet_files.fetch_add(1, Ordering::Relaxed);
                     }
-                    report.line
+                    if args.json {
+                        render_json(path, &result)
+                    } else {
+                        render_text(&result, &db)
+                    }
                 }
-                Err(e) => format!("{}", e),
+                Err(e) => {
+                    if args.json {
+                        format!(
+                            "{{\"path\":{},\"error\":{}}}",
+                            serde_json::Value::String(path.display().to_string()),
+                            serde_json::Value::String(format!("{}", e))
+                        )
+                    } else {
+                        format!("{}", e)
+                    }
+                }
             };
             (path.clone(), line)
         })
         .collect();
 
     for (path, line) in &results {
-        println!("{} : {}", path.display(), line);
+        if args.json {
+            println!("{}", line);
+        } else {
+            println!("{} : {}", path.display(), line);
+        }
     }
 
     if args.time {
@@ -172,21 +193,53 @@ fn preprocess_argv(mut argv: Vec<String>) -> Vec<String> {
     argv
 }
 
-struct Report {
-    line: String,
-    outcome: Outcome,
+struct ScanResult {
     format: Option<BinaryFormat>,
+    arch: Option<String>,
     is_dotnet: bool,
+    finding: Finding,
 }
 
-enum Outcome {
-    Hit,
+enum Finding {
+    Signature {
+        name: String,
+        source: SigSource,
+    },
+    Section {
+        packer: String,
+        section: String,
+    },
+    DotNet {
+        label: String,
+    },
     Nothing,
+    Unrecognized {
+        reason: String,
+    },
+}
+
+impl ScanResult {
+    fn outcome(&self) -> Outcome {
+        match self.finding {
+            Finding::Signature { .. } => Outcome::SignatureHit,
+            Finding::Section { .. } => Outcome::SectionHit,
+            Finding::DotNet { .. } => Outcome::DotNetFallback,
+            Finding::Nothing => Outcome::Nothing,
+            Finding::Unrecognized { .. } => Outcome::Unrecognized,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Outcome {
+    SignatureHit,
+    SectionHit,
     DotNetFallback,
+    Nothing,
     Unrecognized,
 }
 
-fn scan_file(path: &Path, db: &SignatureDb, mode: Mode, raw: bool) -> Result<Report> {
+fn scan_file(path: &Path, db: &SignatureDb, mode: Mode, raw: bool) -> Result<ScanResult> {
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mmap = unsafe { Mmap::map(&file) }
         .with_context(|| format!("mmapping {}", path.display()))?;
@@ -201,86 +254,159 @@ fn scan_file(path: &Path, db: &SignatureDb, mode: Mode, raw: bool) -> Result<Rep
             bytes: &mmap,
         };
         let hit = scan(db, &view, Mode::Hardcore);
-        return Ok(format_report(None, None, false, hit, db, mode));
+        return Ok(build_result(None, None, false, hit, None, None));
     }
 
     match BinaryView::parse(&mmap) {
         Ok(view) => {
+            let format = Some(view.format);
+            let arch = Some(view.arch.as_str().to_string());
+            let is_dotnet = view.dotnet.is_some();
             let hit = scan(db, &view, mode);
-            Ok(format_report(
-                Some(view.format),
-                Some(view.arch.as_str().to_string()),
-                view.dotnet.is_some(),
-                hit,
-                db,
-                mode,
-            ).with_dotnet(view.dotnet.as_ref()))
+            let section_hit = if hit.is_none() {
+                detect_pe_sections(&view)
+            } else {
+                None
+            };
+            Ok(build_result(format, arch, is_dotnet, hit, section_hit, view.dotnet.as_ref()))
         }
-        Err(BinaryParseError::Unrecognized) => Ok(Report {
-            line: "Unrecognized binary format".to_string(),
-            outcome: Outcome::Unrecognized,
+        Err(BinaryParseError::Unrecognized) => Ok(ScanResult {
             format: None,
+            arch: None,
             is_dotnet: false,
+            finding: Finding::Unrecognized {
+                reason: "unrecognized format".to_string(),
+            },
         }),
-        Err(BinaryParseError::Goblin(s)) => Ok(Report {
-            line: format!("Not a valid binary ({})", s),
-            outcome: Outcome::Unrecognized,
+        Err(BinaryParseError::Goblin(s)) => Ok(ScanResult {
             format: None,
+            arch: None,
             is_dotnet: false,
+            finding: Finding::Unrecognized { reason: s },
         }),
     }
 }
 
-impl Report {
-    fn with_dotnet(mut self, dn: Option<&DotNetInfo>) -> Self {
-        match (&self.outcome, dn) {
-            (Outcome::Nothing, Some(info)) => {
-                self.line = format!(
-                    "{} : {}",
-                    self.line.trim_end_matches(" *"),
-                    dotnet_label(info)
-                );
-                self.outcome = Outcome::DotNetFallback;
-            }
-            _ => {}
-        }
-        self
-    }
-}
-
-fn format_report(
+fn build_result(
     format: Option<BinaryFormat>,
     arch: Option<String>,
     is_dotnet: bool,
     hit: Option<&Signature>,
-    db: &SignatureDb,
-    _mode: Mode,
-) -> Report {
-    let tag = format_tag(format, arch.as_deref(), is_dotnet);
-    match hit {
-        Some(sig) => {
-            let prefix = if matches!(sig.source, SigSource::External) {
-                "* "
-            } else {
-                ""
-            };
-            Report {
-                line: format!("{}{}{}", tag, prefix, sig.name),
-                outcome: Outcome::Hit,
-                format,
-                is_dotnet,
-            }
+    section_hit: Option<SectionHit>,
+    dotnet: Option<&DotNetInfo>,
+) -> ScanResult {
+    let finding = if let Some(sig) = hit {
+        Finding::Signature {
+            name: sig.name.clone(),
+            source: sig.source,
         }
-        None => {
+    } else if let Some(s) = section_hit {
+        Finding::Section {
+            packer: s.packer.to_string(),
+            section: s.section,
+        }
+    } else if let Some(info) = dotnet {
+        Finding::DotNet {
+            label: dotnet_label(info),
+        }
+    } else {
+        Finding::Nothing
+    };
+    ScanResult {
+        format,
+        arch,
+        is_dotnet,
+        finding,
+    }
+}
+
+fn render_text(result: &ScanResult, db: &SignatureDb) -> String {
+    let tag = format_tag(result.format, result.arch.as_deref(), result.is_dotnet);
+    match &result.finding {
+        Finding::Signature { name, source } => {
+            let prefix = if matches!(source, SigSource::External) { "* " } else { "" };
+            format!("{}{}{}", tag, prefix, name)
+        }
+        Finding::Section { packer, section } => {
+            format!("{}{} [section: {}]", tag, packer, section)
+        }
+        Finding::DotNet { label } => format!("{}{}", tag, label),
+        Finding::Nothing => {
             let suffix = if db.has_external { " *" } else { "" };
-            Report {
-                line: format!("{}Nothing found{}", tag, suffix),
-                outcome: Outcome::Nothing,
-                format,
-                is_dotnet,
+            format!("{}Nothing found{}", tag, suffix)
+        }
+        Finding::Unrecognized { reason } => {
+            if reason == "unrecognized format" {
+                "Unrecognized binary format".to_string()
+            } else {
+                format!("Not a valid binary ({})", reason)
             }
         }
     }
+}
+
+fn render_json(path: &Path, result: &ScanResult) -> String {
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "path".to_string(),
+        serde_json::Value::String(path.display().to_string()),
+    );
+    obj.insert(
+        "format".to_string(),
+        match result.format {
+            Some(BinaryFormat::Pe) => serde_json::Value::String("PE".into()),
+            Some(BinaryFormat::Elf) => serde_json::Value::String("ELF".into()),
+            Some(BinaryFormat::MachO) => serde_json::Value::String("Mach-O".into()),
+            None => serde_json::Value::Null,
+        },
+    );
+    obj.insert(
+        "arch".to_string(),
+        match &result.arch {
+            Some(a) => serde_json::Value::String(a.clone()),
+            None => serde_json::Value::Null,
+        },
+    );
+    obj.insert(
+        "dotnet".to_string(),
+        serde_json::Value::Bool(result.is_dotnet),
+    );
+    let (detector, name, source, section) = match &result.finding {
+        Finding::Signature { name, source } => (
+            "signature",
+            Some(name.clone()),
+            Some(match source {
+                SigSource::Internal => "internal",
+                SigSource::External => "external",
+            }),
+            None,
+        ),
+        Finding::Section { packer, section } => {
+            ("section", Some(packer.clone()), None, Some(section.clone()))
+        }
+        Finding::DotNet { label } => ("dotnet", Some(label.clone()), None, None),
+        Finding::Nothing => ("none", None, None, None),
+        Finding::Unrecognized { reason } => ("unrecognized", Some(reason.clone()), None, None),
+    };
+    obj.insert(
+        "detector".to_string(),
+        serde_json::Value::String(detector.to_string()),
+    );
+    obj.insert(
+        "result".to_string(),
+        name.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null),
+    );
+    obj.insert(
+        "source".to_string(),
+        source
+            .map(|s| serde_json::Value::String(s.to_string()))
+            .unwrap_or(serde_json::Value::Null),
+    );
+    obj.insert(
+        "section".to_string(),
+        section.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null),
+    );
+    serde_json::Value::Object(obj).to_string()
 }
 
 fn format_tag(format: Option<BinaryFormat>, arch: Option<&str>, is_dotnet: bool) -> String {
