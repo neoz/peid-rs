@@ -9,8 +9,9 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 use walkdir::WalkDir;
 
-use peid_rs::binary::{BinaryFormat, BinaryParseError, BinaryView, DotNetInfo};
+use peid_rs::binary::{BinaryFormat, BinaryView, DotNetInfo};
 use peid_rs::db::{parse_db_lossy, SigSource};
+use peid_rs::fileinfo::{detect as detect_fileinfo, FileInfo, MagicHit, TextInfo};
 use peid_rs::scanner::{scan, Mode};
 use peid_rs::section_db::{detect_pe as detect_pe_sections, SectionHit};
 use peid_rs::signature::{Signature, SignatureDb};
@@ -99,7 +100,9 @@ fn main() -> Result<()> {
                         Outcome::Unrecognized => {
                             unrecognized.fetch_add(1, Ordering::Relaxed);
                         }
-                        Outcome::DotNetFallback | Outcome::Nothing => {}
+                        Outcome::DotNetFallback
+                        | Outcome::FileInfo
+                        | Outcome::Nothing => {}
                     }
                     match result.format {
                         Some(BinaryFormat::Pe) => {
@@ -214,6 +217,12 @@ enum Finding {
     DotNet {
         label: String,
     },
+    Magic {
+        hit: MagicHit,
+    },
+    Text {
+        info: TextInfo,
+    },
     Nothing,
     Unrecognized {
         reason: String,
@@ -226,6 +235,8 @@ impl ScanResult {
             Finding::Signature { .. } => Outcome::SignatureHit,
             Finding::Section { .. } => Outcome::SectionHit,
             Finding::DotNet { .. } => Outcome::DotNetFallback,
+            Finding::Magic { .. } => Outcome::FileInfo,
+            Finding::Text { .. } => Outcome::FileInfo,
             Finding::Nothing => Outcome::Nothing,
             Finding::Unrecognized { .. } => Outcome::Unrecognized,
         }
@@ -237,6 +248,7 @@ enum Outcome {
     SignatureHit,
     SectionHit,
     DotNetFallback,
+    FileInfo,
     Nothing,
     Unrecognized,
 }
@@ -289,22 +301,24 @@ fn scan_file(path: &Path, db: &SignatureDb, mode: Mode, raw: bool) -> Result<Sca
                 toolchain,
             ))
         }
-        Err(BinaryParseError::Unrecognized) => Ok(ScanResult {
-            format: None,
-            arch: None,
-            is_dotnet: false,
-            finding: Finding::Unrecognized {
-                reason: "unrecognized format".to_string(),
-            },
-            toolchain: ToolchainInfo::default(),
-        }),
-        Err(BinaryParseError::Goblin(s)) => Ok(ScanResult {
-            format: None,
-            arch: None,
-            is_dotnet: false,
-            finding: Finding::Unrecognized { reason: s },
-            toolchain: ToolchainInfo::default(),
-        }),
+        Err(_) => {
+            let path_hint = path.to_str();
+            let info = detect_fileinfo(&mmap, path_hint);
+            let finding = match info {
+                FileInfo::Magic(hit) => Finding::Magic { hit },
+                FileInfo::Text(info) => Finding::Text { info },
+                FileInfo::Unknown => Finding::Unrecognized {
+                    reason: "unrecognized format".to_string(),
+                },
+            };
+            Ok(ScanResult {
+                format: None,
+                arch: None,
+                is_dotnet: false,
+                finding,
+                toolchain: ToolchainInfo::default(),
+            })
+        }
     }
 }
 
@@ -354,13 +368,24 @@ fn render_text(result: &ScanResult, db: &SignatureDb) -> String {
             format!("{}{} [section: {}]", tag, packer, section)
         }
         Finding::DotNet { label } => format!("{}{}", tag, label),
+        Finding::Magic { hit } => {
+            format!("({}) {}", hit.category.as_str(), hit.name)
+        }
+        Finding::Text { info } => {
+            format!(
+                "(Text {} {}) {}",
+                info.encoding.as_str(),
+                info.line_ending.as_str(),
+                info.kind.label()
+            )
+        }
         Finding::Nothing => {
             let suffix = if db.has_external { " *" } else { "" };
             format!("{}Nothing found{}", tag, suffix)
         }
         Finding::Unrecognized { reason } => {
             if reason == "unrecognized format" {
-                "Unrecognized binary format".to_string()
+                "Unrecognized format".to_string()
             } else {
                 format!("Not a valid binary ({})", reason)
             }
@@ -423,6 +448,8 @@ fn render_json(path: &Path, result: &ScanResult) -> String {
             ("section", Some(packer.clone()), None, Some(section.clone()))
         }
         Finding::DotNet { label } => ("dotnet", Some(label.clone()), None, None),
+        Finding::Magic { hit } => ("magic", Some(hit.name.to_string()), None, None),
+        Finding::Text { info } => ("text", Some(info.kind.label()), None, None),
         Finding::Nothing => ("none", None, None, None),
         Finding::Unrecognized { reason } => ("unrecognized", Some(reason.clone()), None, None),
     };
@@ -443,6 +470,28 @@ fn render_json(path: &Path, result: &ScanResult) -> String {
     obj.insert(
         "section".to_string(),
         section.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null),
+    );
+
+    let (category, encoding, line_ending) = match &result.finding {
+        Finding::Magic { hit } => (Some(hit.category.as_str().to_string()), None, None),
+        Finding::Text { info } => (
+            Some("Text".to_string()),
+            Some(info.encoding.as_str().to_string()),
+            Some(info.line_ending.as_str().to_string()),
+        ),
+        _ => (None, None, None),
+    };
+    obj.insert(
+        "category".to_string(),
+        category.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null),
+    );
+    obj.insert(
+        "encoding".to_string(),
+        encoding.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null),
+    );
+    obj.insert(
+        "line_ending".to_string(),
+        line_ending.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null),
     );
 
     let mut tc = serde_json::Map::new();

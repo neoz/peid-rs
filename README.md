@@ -69,6 +69,11 @@ managed.dll   : (PE .NET x86)       Microsoft Visual C# / Basic .NET  [linker 14
 linux.so      : (ELF aarch64)       Nothing found *  [compiler GCC: (Ubuntu 9.4.0-1ubuntu1~20.04.1) 9.4.0]
 mac.dylib     : (Mach-O x86_64)     Nothing found *  [platform macOS minos=10.9 sdk=10.9]
 vmp.exe       : (PE x86_64)         VMProtect 3.x (heuristic) [section: .qWo, .xz@]  [linker 14.0 (VS 2015)]
+Cargo.toml    : (Text ASCII LF)     TOML
+userdb.txt    : (Text ASCII CRLF)   PEiD signature database
+lib.rs        : (Text ASCII LF)     Source code (Rust)
+docs.pdf      : (Document)          PDF
+photo.png     : (Image)             PNG
 ```
 
 Conventions inherited from PEiD:
@@ -94,6 +99,20 @@ Three packer detectors run in order; the first to fire wins:
 3. **.NET fallback**. If no signature or section rule fired but the PE has
    a CLR data directory, the result reports the .NET runtime version and IL
    / mixed-mode flag.
+
+For files that goblin can't parse as an executable, a **fileinfo** fallback
+runs and reports either:
+
+- **Magic bytes** for common non-executable formats: PDF, PNG / JPEG / GIF /
+  BMP / WebP, ZIP / 7-Zip / RAR / tar, gzip / bzip2 / xz / Zstandard, MP3 /
+  MP4 / Ogg / FLAC / WAV / AVI, SQLite 3, Java class / WebAssembly bytecode,
+  TrueType / OpenType / WOFF fonts.
+- **Text classification**: encoding (`ASCII` / `UTF-8` / `UTF-8 BOM` /
+  `UTF-16 LE/BE` / `Latin-1?`), line ending (`LF` / `CRLF` / `CR` /
+  `mixed` / `no-newline`), and a content kind via content sniffing
+  (shebang, XML, JSON, TOML, Markdown, HTML, PEiD signature DB,
+  `.gitignore`) or extension hints (Rust / Python / JS / TS / C / C++ /
+  Go / Java / shell / PowerShell).
 
 A separate **toolchain detector** runs independently and is reported
 alongside the packer result. It surfaces:
