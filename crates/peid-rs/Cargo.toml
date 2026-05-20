@@ -1,0 +1,11 @@
+[package]
+name = "peid-rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+goblin = { workspace = true }
+
+[lib]
+path = "src/lib.rs"

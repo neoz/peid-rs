@@ -1,0 +1,17 @@
+[package]
+name = "peid-rs-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "peid-rs"
+path = "src/main.rs"
+
+[dependencies]
+peid-rs = { path = "../peid-rs" }
+clap = { workspace = true }
+walkdir = { workspace = true }
+memmap2 = { workspace = true }
+rayon = { workspace = true }
+anyhow = { workspace = true }
